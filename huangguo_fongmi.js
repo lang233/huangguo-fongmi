@@ -421,13 +421,19 @@ export default {
         url = SITE + '/' + id + '/' + (page > 1 ? page + '/' : '');
       }
       const html = getHtml(url);
-      const list = String(tid).indexOf('rank') !== -1 ? parseRanks(html) : parseGridCards(html, false);
+      const isRank = String(tid).indexOf('rank') !== -1;
+      const list = isRank ? parseRanks(html) : parseGridCards(html, false);
+      // 排行榜是单页固定列表：站点 /ranks/hot/N/ 在 N>1 时并不分页，只会返回兜底重复内容，
+      // 若宣称“有下一页”会让 app 持续请求并追加重复条目（实测第2页==第3页，永不返回空）。
+      // 故只有“非排行榜且有数据”才宣称有下一页；普通分类页在下一页返回空时仍会自然终止。
+      const hasNext = !isRank && list.length > 0;
+      const n = list.length || 20;
       return JSON.stringify({
         list: list,
         page: page,
-        pagecount: list.length ? page + 1 : page,
-        limit: list.length || 20,
-        total: list.length ? (page + 1) * (list.length || 20) : page * 20
+        pagecount: hasNext ? page + 1 : page,
+        limit: n,
+        total: hasNext ? (page + 1) * n : page * n
       });
     } catch (e) {
       return JSON.stringify({ list: [], page: page, pagecount: page });
