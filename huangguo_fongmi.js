@@ -1,12 +1,18 @@
-// huangguo_fongmi.js
-// FongMi / 影视TV QuickJS Spider adapter
-// Adapted from Yswag/xptv-extensions huangguo.js
+// fongmi_optimized.js
+// FongMi / 影视TV QuickJS Spider adapter —— 优化版
+// 基于 huangguo_fongmi.js 重构，站点抓取/解析逻辑保持不变，重点修复：
 import 'assets://js/lib/crypto-js.js';
 
 const SITE = 'https://huangguoai.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const IMG_KEY = 'f5d965df75336270';
 const IMG_IV = '97b60394abc2fbe1';
+const TIMEOUT_MS = 7000;      // 单封面取图超时(ms)
+const DEBUG = false;          // 置 true 可打印取图/解密失败原因
+// 服务端解密Worker地址。填上后封面 URL 直接指向明文图（TV端稳定，推荐）：
+// 留空 '' 则回退到蜘蛛 proxy() 运行时解密（依赖 app 把封面请求走代理，TV 上不稳）。
+const DECRYPT_HOST = 'https://cover-decrypt.qq308375072.workers.dev';
+
 const EMPTY_IMAGE = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXcAAAAASUVORK5CYII=';
 
 const HEADERS = {
@@ -24,6 +30,13 @@ const CLASSES = [
   { type_id: 'ranks/hot',  type_name: '排行榜' }
 ];
 
+function log(msg) {
+  if (!DEBUG) return;
+  try {
+    if (typeof console !== 'undefined' && console.log) console.log('[huangguo] ' + msg);
+  } catch (e) {}
+}
+
 function fix(u) {
   if (!u) return '';
   u = String(u).replace(/&amp;/g, '&');
@@ -35,6 +48,9 @@ function fix(u) {
 function coverUrl(u) {
   u = fix(u).replace(/\?.*$/, '');
   if (!/^https?:\/\//i.test(u)) return '';
+  // 优先走服务端解密：封面变成明文图，TV 端直接加载，稳定可靠，绕开 proxy() 链路。
+  // 未配置 DECRYPT_HOST 时回退到蜘蛛 proxy() 运行时解密。
+  if (DECRYPT_HOST) return DECRYPT_HOST + '/?url=' + encodeURIComponent(u);
   return getProxy(true) + '&siteKey=huangguo_fongmi&url=' + encodeURIComponent(u);
 }
 
@@ -46,27 +62,73 @@ function imageType(b64) {
   return '';
 }
 
-function decryptCover(b64) {
-  if (imageType(b64)) return b64;
-  const ciphertext = CryptoJS.enc.Base64.parse(b64);
-  if (!ciphertext.sigBytes || ciphertext.sigBytes % 16) return '';
+// ---------- 解密（优化核心） ----------
+
+// 字节数组 -> 小写十六进制
+function bytesToHex(buf) {
+  let h = '';
+  for (let i = 0; i < buf.length; i++) {
+    const c = buf[i] & 0xff;
+    h += (c < 16 ? '0' : '') + c.toString(16);
+  }
+  return h;
+}
+
+// 把 req 返回的“任意形态”响应体，统一转成【原始密文的十六进制】
+// 覆盖四种情况：base64 字符串 / latin1 原始字节字符串 / ArrayBuffer / Uint8Array
+function toCipherHex(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') {
+    const s = String(content).replace(/\s+/g, '');
+    // 形态A：base64 字符串（buffer:2 的常见返回），解码后长度须为 16 的倍数
+    if (s.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(s)) {
+      try {
+        const wa = CryptoJS.enc.Base64.parse(s);
+        if (wa.sigBytes && wa.sigBytes % 16 === 0) return CryptoJS.enc.Hex.stringify(wa);
+      } catch (e) { log('base64 parse failed: ' + e); }
+    }
+    // 形态B：latin1 原始字节字符串（部分引擎把 buffer:2 当成原始字节返回）
+    const arr = new Array(s.length);
+    for (let i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i);
+    return bytesToHex(arr);
+  }
+  // 形态C：ArrayBuffer / Uint8Array / 数字数组
+  if (content instanceof ArrayBuffer) return bytesToHex(new Uint8Array(content));
+  if (content instanceof Uint8Array) return bytesToHex(content);
+  if (Array.isArray(content)) return bytesToHex(Uint8Array.from(content));
+  if (content && typeof content.byteLength === 'number') {
+    try { return bytesToHex(new Uint8Array(content.buffer || content)); } catch (e) { log('arraybuffer convert failed'); }
+  }
+  return '';
+}
+
+// 对密文 hex 做 AES-128-CBC(NoPadding) 解密，去填充、截尾，返回 base64 图片；失败返回 ''
+function decryptHex(hex) {
+  if (!hex || hex.length % 32) { log('cipher hex length invalid: ' + (hex || '').length); return ''; }
+  const ciphertext = CryptoJS.enc.Hex.parse(hex);
   const plaintext = CryptoJS.AES.decrypt(
-    { ciphertext: ciphertext }, CryptoJS.enc.Utf8.parse(IMG_KEY),
+    { ciphertext: ciphertext },
+    CryptoJS.enc.Utf8.parse(IMG_KEY),
     { iv: CryptoJS.enc.Utf8.parse(IMG_IV), mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.NoPadding }
   );
-  let hex = CryptoJS.enc.Hex.stringify(plaintext).toLowerCase();
-  if (!/^(ffd8|89504e470d0a1a0a|52494646|47494638)/.test(hex)) return '';
-  const pad = parseInt(hex.slice(-2), 16);
-  if (pad > 0 && pad <= 16 && hex.slice(-2 * pad) === pad.toString(16).padStart(2, '0').repeat(pad)) {
-    hex = hex.slice(0, -2 * pad);
+  let h = CryptoJS.enc.Hex.stringify(plaintext).toLowerCase();
+  if (!/^(ffd8|89504e470d0a1a0a|52494646|47494638)/.test(h)) { log('bad image magic: ' + h.slice(0, 8)); return ''; }
+  // 去 PKCS#7 填充
+  const pad = parseInt(h.slice(-2), 16);
+  if (pad > 0 && pad <= 16 && h.slice(-2 * pad) === pad.toString(16).padStart(2, '0').repeat(pad)) {
+    h = h.slice(0, -2 * pad);
   }
-  let end = hex.lastIndexOf('ffd9');
-  if (hex.indexOf('ffd8') === 0 && end >= 0) hex = hex.slice(0, end + 4);
-  end = hex.lastIndexOf('49454e44ae426082');
-  if (hex.indexOf('89504e47') === 0 && end >= 0) hex = hex.slice(0, end + 16);
-  const out = CryptoJS.enc.Base64.stringify(CryptoJS.enc.Hex.parse(hex));
-  return imageType(out) ? out : '';
+  // 截断到图片真正结尾，丢弃尾部多余字节（JPEG 到 FFD9，PNG 到 IEND）
+  let end = h.lastIndexOf('ffd9');
+  if (h.indexOf('ffd8') === 0 && end >= 0) h = h.slice(0, end + 4);
+  end = h.lastIndexOf('49454e44ae426082');
+  if (h.indexOf('89504e47') === 0 && end >= 0) h = h.slice(0, end + 16);
+  const out = CryptoJS.enc.Base64.stringify(CryptoJS.enc.Hex.parse(h));
+  if (!imageType(out)) { log('decoded output is not a valid image'); return ''; }
+  return out;
 }
+
+// ---------- HTML 解析（保持原逻辑不变） ----------
 
 function stripTags(s) {
   return String(s || '')
@@ -83,7 +145,7 @@ function stripTags(s) {
 function getHtml(url, referer) {
   const headers = Object.assign({}, HEADERS);
   if (referer) headers.Referer = referer;
-  const r = req(url, { method: 'get', headers: headers, timeout: 15000 });
+  const r = req(url, { method: 'get', headers: headers, timeout: TIMEOUT_MS });
   if (!r) return '';
   return typeof r.content === 'string' ? r.content : '';
 }
@@ -328,6 +390,8 @@ function extractPlay(html, ep) {
   return play;
 }
 
+// ---------- 对外接口 ----------
+
 export default {
   init(ext) {
     this.ext = ext || {};
@@ -447,13 +511,21 @@ export default {
   proxy(params) {
     try {
       const url = String(params && params.url || '');
-      if (!/^https?:\/\//i.test(url)) return [200, 'image/png', EMPTY_IMAGE, {}, 1];
-      const r = req(url, { method: 'get', headers: HEADERS, buffer: 2, timeout: 7000 });
-      if (!r || Number(r.code) !== 200 || !r.content) return [200, 'image/png', EMPTY_IMAGE, {}, 1];
-      const image = decryptCover(String(r.content));
-      if (!image) return [200, 'image/png', EMPTY_IMAGE, {}, 1];
+      if (!/^https?:\/\//i.test(url)) { log('proxy: invalid url'); return [200, 'image/png', EMPTY_IMAGE, {}, 1]; }
+      const r = req(url, { method: 'get', headers: HEADERS, buffer: 2, timeout: TIMEOUT_MS });
+      if (!r || Number(r.code) !== 200 || !r.content) {
+        log('proxy: fetch fail for ' + url + ' code=' + (r && r.code));
+        return [200, 'image/png', EMPTY_IMAGE, {}, 1];
+      }
+      // 统一归一化响应体 -> 密文 hex -> 解密（自动适配 buffer 返回形态）
+      const image = decryptHex(toCipherHex(r.content));
+      if (!image) {
+        log('proxy: decrypt fail for ' + url);
+        return [200, 'image/png', EMPTY_IMAGE, {}, 1];
+      }
       return [200, imageType(image), image, { 'Cache-Control': 'public, max-age=3600' }, 1];
     } catch (e) {
+      log('proxy: error ' + e);
       return [200, 'image/png', EMPTY_IMAGE, {}, 1];
     }
   }
